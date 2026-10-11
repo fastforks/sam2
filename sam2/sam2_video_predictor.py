@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from tqdm import tqdm
 
+from sam2.fast import make_fast_video
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
@@ -48,7 +49,12 @@ class SAM2VideoPredictor(SAM2Base):
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
+        # CUDA, inference only: fp16 image encoder, fp16 autocast, threaded frame loader (set up once, after
+        # .to(device)); CPU / MPS and the compiled VOS predictor run as upstream
+        if type(self) is SAM2VideoPredictor and compute_device.type == "cuda":
+            make_fast_video(self)
+        loader = getattr(self, "_load_video_frames", load_video_frames)
+        images, video_height, video_width = loader(
             video_path=video_path,
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,

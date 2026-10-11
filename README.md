@@ -1,3 +1,45 @@
+# SAM 2: faster inference fork
+
+> **You are on `portable`.** Research fork of [facebookresearch/sam2](https://github.com/facebookresearch/sam2) (base `2b90b9f`; `main` mirrors upstream). One branch with all changes: SAM 2 needed no custom kernels, so there is no `cuda-kernels` branch. Plain PyTorch (the fp16 image encoder exports to ONNX / TensorRT); the optional `fast_encoder(model, fp16_accumulate=True)` (sets `torch.backends.cuda.matmul.allow_fp16_accumulation` around the image encoder) is the only non-portable part.
+> Licence, as upstream: [Apache 2.0](LICENSE) (code), checkpoints under their upstream licence (not included here).
+
+```python
+# the upstream API, fast by default on CUDA (inference only: converts the image encoder to fp16 in place); CPU / MPS run as upstream
+from sam2.build_sam import build_sam2, build_sam2_video_predictor
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+pred = SAM2ImagePredictor(build_sam2(cfg, ckpt))
+pred.set_image(image)
+masks, scores, logits = pred.predict(box=box, multimask_output=False)
+video = build_sam2_video_predictor(cfg, ckpt)  # fast by default on CUDA (set up at init_state); the compiled VOS predictor runs as upstream
+
+# optional, not portable: fp16-accumulate GEMMs, faster on Ampere and newer
+from sam2.fast import fast_encoder
+pred = SAM2ImagePredictor(fast_encoder(build_sam2(cfg, ckpt), fp16_accumulate=True))
+```
+Tests: `SAM2_CHECKPOINT=/path/to/sam2.1_hiera_tiny.pt pytest tests/test_fast.py`.
+
+**Image** (`set_image` + one-point `predict`, 3 masks to the host). RTX 5060 Ti 16 GB, torch 2.14.1+cu130, 2026-10-12; cold process, median of 10 runs after one first call. A = 1297x840 image, B = 2594x1681 image. Memory = torch peak allocated / reserved at A; weights 289 / 1001 MB upstream (T / L, fp32) vs 238 / 594 MB here. Agreement: mean mask IoU vs upstream on 21 images x 16 point prompts (upstream fp32 vs upstream bf16 = precision reference).
+
+| version | T: A ms | T: B ms | L: A ms | L: B ms | speed-up at A (T / L) | peak MB at A, T | peak MB at A, L | startup / first-call overhead / new-size overhead (L) | IoU vs upstream (T / L) |
+|---|---|---|---|---|---|---|---|---|---|
+| upstream (bf16 autocast, as its README) | 30.8 | 81.0 | 86.4 | 141.5 | 1.00x / 1.00x | 526 / 652 | 1316 / 1554 | 4.2 s / +324 ms / +0 ms | 1 / 1 |
+| upstream fp32 (precision reference) | - | - | - | - | - | - | - | - | 0.955 / 0.964 |
+| **portable** | 18.9 | 23.7 | 70.6 | 75.2 | 1.63x / 1.22x | 484 / 586 | 919 / 1390 | 3.7 s / +304 ms / +30 ms | 0.955 / 0.966 |
+| **portable + `fp16_accumulate`** | 17.5 | 22.2 | 57.2 | 62.2 | 1.76x / 1.51x | 484 / 586 | 919 / 1390 | 3.7 s / +299 ms / +31 ms | 0.955 / 0.965 |
+
+**Video** (16 frames of a JPEG folder, `init_state` + one point + `propagate_in_video`, masks to the host; ms for the whole clip at A / B; peak MB = allocated / reserved at A). Agreement: mean mask IoU vs upstream on 5 clips x 3 objects x 16 frames.
+
+| version | Hiera-T A / B ms | speed-up at A | peak MB | Hiera-L A / B ms | speed-up at A | peak MB | IoU vs upstream (T / L) |
+|---|---|---|---|---|---|---|---|
+| upstream | 1082 / 1676 | 1.00x | 777 / 920 | 2017 / 2606 | 1.00x | 1565 / 1822 | 1 / 1 |
+| upstream fp32 (precision reference) | - | - | - | - | - | - | 0.989 / 0.978 |
+| **portable** | 594 / 849 | 1.82x | 710 / 792 | 1419 / 1681 | 1.42x | 1127 / 1414 | 0.989 / 0.975 |
+| **portable + `fp16_accumulate`** | 569 / 831 | 1.90x | 710 / 792 | 1208 / 1469 | 1.67x | 1127 / 1414 | 0.988 / 0.976 |
+
+Upstream runs under bf16 autocast, the fork in fp16 (same tensor-core rate). New image size: no recompilation (eager PyTorch); the +30 ms is the first call at B over steady state. All fork rows are measured through the upstream API; the precision-reference and IoU rows are from the earlier study (same GPU, same CUDA code path, 2026-10-10).
+
+---
+
 # SAM 2: Segment Anything in Images and Videos
 
 **[AI at Meta, FAIR](https://ai.meta.com/research/)**

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from PIL.Image import Image
 
+from sam2.fast import fast_encoder, preprocess, to_host
 from sam2.modeling.sam2_base import SAM2Base
 
 from sam2.utils.transforms import SAM2Transforms
@@ -38,14 +39,25 @@ class SAM2ImagePredictor:
             the maximum area of max_hole_area in low_res_masks.
           max_sprinkle_area (int): If max_sprinkle_area > 0, we remove small sprinkles up to
             the maximum area of max_sprinkle_area in low_res_masks.
+
+        Inference only: on CUDA, converts the model's image encoder to fp16 in place (CPU / MPS run as upstream).
         """
         super().__init__()
-        self.model = sam_model
+        self.model = (
+            fast_encoder(sam_model) if sam_model.device.type == "cuda" else sam_model
+        )
         self._transforms = SAM2Transforms(
             resolution=self.model.image_size,
             mask_threshold=mask_threshold,
             max_hole_area=max_hole_area,
             max_sprinkle_area=max_sprinkle_area,
+        )
+        # GPU preprocessing: normalisation of [0, 255] values
+        self._mean = (
+            torch.tensor(self._transforms.mean, device=self.device)[:, None, None] * 255
+        )
+        self._std = (
+            torch.tensor(self._transforms.std, device=self.device)[:, None, None] * 255
         )
 
         # Predictor state
@@ -107,18 +119,13 @@ class SAM2ImagePredictor:
         else:
             raise NotImplementedError("Image format not supported")
 
-        input_image = self._transforms(image)
-        input_image = input_image[None, ...].to(self.device)
+        input_image = self._preprocess(image)
 
         assert (
             len(input_image.shape) == 4 and input_image.shape[1] == 3
         ), f"input_image must be of size 1x3xHxW, got {input_image.shape}"
         logging.info("Computing image embeddings for the provided image...")
-        backbone_out = self.model.forward_image(input_image)
-        _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
-        # Add no_mem_embed, which is added to the lowest rest feat. map during training on videos
-        if self.model.directly_add_no_mem_embed:
-            vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
+        vision_feats = self._image_features(input_image)
 
         feats = [
             feat.permute(1, 2, 0).view(1, -1, *feat_size)
@@ -150,18 +157,13 @@ class SAM2ImagePredictor:
             ), "Images are expected to be an np.ndarray in RGB format, and of shape  HWC"
             self._orig_hw.append(image.shape[:2])
         # Transform the image to the form expected by the model
-        img_batch = self._transforms.forward_batch(image_list)
-        img_batch = img_batch.to(self.device)
+        img_batch = torch.cat([self._preprocess(image) for image in image_list])
         batch_size = img_batch.shape[0]
         assert (
             len(img_batch.shape) == 4 and img_batch.shape[1] == 3
         ), f"img_batch must be of size Bx3xHxW, got {img_batch.shape}"
         logging.info("Computing image embeddings for the provided images...")
-        backbone_out = self.model.forward_image(img_batch)
-        _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
-        # Add no_mem_embed, which is added to the lowest rest feat. map during training on videos
-        if self.model.directly_add_no_mem_embed:
-            vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
+        vision_feats = self._image_features(img_batch)
 
         feats = [
             feat.permute(1, 2, 0).view(batch_size, -1, *feat_size)
@@ -223,11 +225,9 @@ class SAM2ImagePredictor:
                 return_logits=return_logits,
                 img_idx=img_idx,
             )
-            masks_np = masks.squeeze(0).float().detach().cpu().numpy()
-            iou_predictions_np = (
-                iou_predictions.squeeze(0).float().detach().cpu().numpy()
-            )
-            low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
+            masks_np = to_host(masks.squeeze(0))
+            iou_predictions_np = to_host(iou_predictions.squeeze(0))
+            low_res_masks_np = to_host(low_res_masks.squeeze(0))
             all_masks.append(masks_np)
             all_ious.append(iou_predictions_np)
             all_low_res_masks.append(low_res_masks_np)
@@ -297,10 +297,9 @@ class SAM2ImagePredictor:
             return_logits=return_logits,
         )
 
-        masks_np = masks.squeeze(0).float().detach().cpu().numpy()
-        iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
-        low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
-        return masks_np, iou_predictions_np, low_res_masks_np
+        return tuple(
+            to_host(t.squeeze(0)) for t in (masks, iou_predictions, low_res_masks)
+        )
 
     def _prep_prompts(
         self, point_coords, point_labels, box, mask_logits, normalize_coords, img_idx=-1
@@ -333,7 +332,24 @@ class SAM2ImagePredictor:
                 mask_input = mask_input[None, :, :, :]
         return mask_input, unnorm_coords, labels, unnorm_box
 
+    def _preprocess(self, image):
+        if self.device.type != "cuda":
+            return self._transforms(image)[None].to(self.device)
+        return preprocess(
+            image, self.model.image_size, self._mean, self._std, self.device
+        )
+
+    @torch.autocast("cuda", dtype=torch.float16)
+    def _image_features(self, img_batch):
+        backbone_out = self.model.forward_image(img_batch)
+        _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
+        # Add no_mem_embed, which is added to the lowest rest feat. map during training on videos
+        if self.model.directly_add_no_mem_embed:
+            vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
+        return vision_feats
+
     @torch.no_grad()
+    @torch.autocast("cuda", dtype=torch.float16)
     def _predict(
         self,
         point_coords: Optional[torch.Tensor],

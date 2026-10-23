@@ -27,6 +27,8 @@ Tests: `SAM2_CHECKPOINT=/path/to/sam2.1_hiera_tiny.pt pytest tests/test_fast.py`
 | **portable** | 18.9 | 23.7 | 70.6 | 75.2 | 1.63x / 1.22x | 484 / 586 | 919 / 1390 | 3.7 s / +304 ms / +30 ms | 0.955 / 0.966 |
 | **portable + `fp16_accumulate`** | 17.5 | 22.2 | 57.2 | 62.2 | 1.76x / 1.51x | 484 / 586 | 919 / 1390 | 3.7 s / +299 ms / +31 ms | 0.955 / 0.965 |
 
+Flags: upstream already runs bf16 autocast. `cudnn.benchmark` + TF32 on top gave no gain (image A, L 86.5 -> 87.3 ms, T 31.7 -> 30.1 ms, within noise), so there is no separate flags row and speed-ups against "upstream + flags" equal those against upstream. Raw: `results/2026-10-23_flags_older_forks/` of the publishing workspace.
+
 **Video** (16 frames of a JPEG folder, `init_state` + one point + `propagate_in_video`, masks to the host; ms for the whole clip at A / B; peak MB = allocated / reserved at A). Agreement: mean mask IoU vs upstream on 5 clips x 3 objects x 16 frames.
 
 | version | Hiera-T A / B ms | speed-up at A | peak MB | Hiera-L A / B ms | speed-up at A | peak MB | IoU vs upstream (T / L) |
